@@ -21,6 +21,7 @@ OBJS-$(CONFIG_HAPQA_EXTRACT_BSF)          += bsf/hapqa_extract.o
 OBJS-$(CONFIG_HEVC_METADATA_BSF)          += bsf/h265_metadata.o
 OBJS-$(CONFIG_DOVI_RPU_BSF)               += bsf/dovi_rpu.o
 OBJS-$(CONFIG_HEVC_MP4TOANNEXB_BSF)       += bsf/hevc_mp4toannexb.o
+OBJS-$(CONFIG_HEVC_PASSTHROUGH_BSF)       += bsf/hevc_passthrough.o
 OBJS-$(CONFIG_IMX_DUMP_HEADER_BSF)        += bsf/imx_dump_header.o
 OBJS-$(CONFIG_MEDIA100_TO_MJPEGB_BSF)     += bsf/media100_to_mjpegb.o
 OBJS-$(CONFIG_MJPEG2JPEG_BSF)             += bsf/mjpeg2jpeg.o
