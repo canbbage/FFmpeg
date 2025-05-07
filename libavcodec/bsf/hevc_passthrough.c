@@ -45,37 +45,126 @@ static int hevc_passthrough_filter(AVBSFContext *ctx, AVPacket *pkt)
     if (ret < 0)
         return ret;
         
-    if (s->verbose) {
-        // 如果启用了详细日志，解析HEVC NAL单元信息并输出
-        ret = ff_cbs_read_packet(s->cbc, &s->fragment, pkt);
-        if (ret < 0) {
-            av_log(ctx, AV_LOG_ERROR, "Failed to parse HEVC packet.\n");
-            goto fail;
-        }
-        
-        av_log(ctx, AV_LOG_INFO, "HEVC packet with %d NAL units\n", 
-               s->fragment.nb_units);
-               
-        for (int i = 0; i < s->fragment.nb_units; i++) {
-            CodedBitstreamUnit *unit = &s->fragment.units[i];
-            if (unit->type == HEVC_NAL_VPS)
-                av_log(ctx, AV_LOG_DEBUG, "  NAL %d: VPS\n", i);
-            else if (unit->type == HEVC_NAL_SPS)
-                av_log(ctx, AV_LOG_DEBUG, "  NAL %d: SPS\n", i);
-            else if (unit->type == HEVC_NAL_PPS)
-                av_log(ctx, AV_LOG_DEBUG, "  NAL %d: PPS\n", i);
-            else
-                av_log(ctx, AV_LOG_DEBUG, "  NAL %d: type %d\n", i, unit->type);
-        }
-        
-        ff_cbs_fragment_reset(&s->fragment);
+    // 使用 CBS 系统解析 HEVC 数据包
+    ret = ff_cbs_read_packet(s->cbc, &s->fragment, pkt);
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to parse HEVC packet.\n");
+        goto fail;
     }
     
-    // 在这里你可以增加其他处理，暂时我们只进行透明通过
+    // 输出 NAL 单元信息（如果启用了详细日志）
+    if (s->verbose) {
+        av_log(ctx, AV_LOG_INFO, "HEVC packet with %d NAL units\n", s->fragment.nb_units);
+    }
+    
+    // 处理每个 NAL 单元
+    for (int i = 0; i < s->fragment.nb_units; i++) {
+        CodedBitstreamUnit *unit = &s->fragment.units[i];
+        
+        if (s->verbose) {
+            // 根据 NAL 类型输出更详细的信息
+            switch (unit->type) {
+                case HEVC_NAL_VPS:
+                    av_log(ctx, AV_LOG_DEBUG, "  NAL %d: VPS\n", i);
+                    break;
+                case HEVC_NAL_SPS:
+                    av_log(ctx, AV_LOG_DEBUG, "  NAL %d: SPS\n", i);
+                    break;
+                case HEVC_NAL_PPS:
+                    av_log(ctx, AV_LOG_DEBUG, "  NAL %d: PPS\n", i);
+                    break;
+                case HEVC_NAL_IDR_W_RADL:
+                case HEVC_NAL_IDR_N_LP:
+                    av_log(ctx, AV_LOG_DEBUG, "  NAL %d: IDR slice\n", i);
+                    break;
+                case HEVC_NAL_TRAIL_R:
+                case HEVC_NAL_TRAIL_N:
+                    av_log(ctx, AV_LOG_DEBUG, "  NAL %d: Trail slice\n", i);
+                    break;
+                case HEVC_NAL_SEI_PREFIX:
+                case HEVC_NAL_SEI_SUFFIX:
+                    av_log(ctx, AV_LOG_DEBUG, "  NAL %d: SEI\n", i);
+                    break;
+                default:
+                    av_log(ctx, AV_LOG_DEBUG, "  NAL %d: type %d\n", i, unit->type);
+                    break;
+            }
+        }
+        
+        // 这里可以根据 NAL 类型添加不同的处理逻辑
+        // 以下是一些示例处理方式
+        switch (unit->type) {
+            case HEVC_NAL_VPS:
+                // 假设修改 VPS
+                // H265RawVPS *vps = (H265RawVPS *)unit->unit_data;
+                // 在这里修改 VPS 参数
+                break;
+                
+            case HEVC_NAL_SPS:
+                // 假设修改 SPS
+                // H265RawSPS *sps = (H265RawSPS *)unit->unit_data;
+                // 在这里修改 SPS 参数，例如修改分辨率、编码参数等
+                break;
+                
+            case HEVC_NAL_PPS:
+                // 假设修改 PPS
+                // H265RawPPS *pps = (H265RawPPS *)unit->unit_data;
+                // 在这里修改 PPS 参数
+                break;
+                
+            case HEVC_NAL_SEI_PREFIX:
+            case HEVC_NAL_SEI_SUFFIX:
+                // 假设修改或添加 SEI 消息
+                // H265RawSEI *sei = (H265RawSEI *)unit->unit_data;
+                // 在这里修改 SEI 消息
+                break;
+                
+            case HEVC_NAL_IDR_W_RADL:
+            case HEVC_NAL_IDR_N_LP:
+            case HEVC_NAL_TRAIL_R:
+            case HEVC_NAL_TRAIL_N:
+                // 假设修改片头或片数据
+                // H265RawSlice *slice = (H265RawSlice *)unit->unit_data;
+                // 在这里修改片参数
+                break;
+                
+            default:
+                // 其他类型的 NAL 单元保持不变
+                break;
+        }
+    }
+    
+    // 创建一个新的数据包来存储修改后的数据
+    AVPacket *new_pkt = NULL;
+    new_pkt = av_packet_alloc();
+    if (!new_pkt) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+    
+    // 将修改后的 NAL 单元写回到新的数据包
+    ret = ff_cbs_write_packet(s->cbc, new_pkt, &s->fragment);
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to write packet.\n");
+        av_packet_free(&new_pkt);
+        goto fail;
+    }
+    
+    // 复制时间戳和其他元数据
+    av_packet_copy_props(new_pkt, pkt);
+    
+    // 替换原始数据包
+    av_packet_unref(pkt);
+    av_packet_move_ref(pkt, new_pkt);
+    av_packet_free(&new_pkt);
+    
+    // 重置片段，释放资源
+    ff_cbs_fragment_reset(&s->fragment);
     
     return 0;
     
 fail:
+    ff_cbs_fragment_reset(&s->fragment);
     av_packet_unref(pkt);
     return ret;
 }
