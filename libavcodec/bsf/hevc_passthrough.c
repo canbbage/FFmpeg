@@ -16,6 +16,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <stdbool.h>
 #include "libavutil/log.h"
 #include "libavutil/opt.h"
 
@@ -34,6 +35,8 @@ typedef struct HEVCPassthroughContext {
     // 上下文状态
     CodedBitstreamContext *cbc;
     CodedBitstreamFragment fragment;
+
+    bool have_B_frame;
 } HEVCPassthroughContext;
 
 static int hevc_passthrough_filter(AVBSFContext *ctx, AVPacket *pkt)
@@ -45,6 +48,12 @@ static int hevc_passthrough_filter(AVBSFContext *ctx, AVPacket *pkt)
     if (ret < 0)
         return ret;
         
+    // 如果已知有B帧，直接跳过处理返回当前包
+    if(s->have_B_frame) {
+        av_log(ctx, AV_LOG_DEBUG, "B frame detected, passing through without processing\n");
+        return 0;
+    }
+    
     // 使用 CBS 系统解析 HEVC 数据包
     ret = ff_cbs_read_packet(s->cbc, &s->fragment, pkt);
     if (ret < 0) {
@@ -56,7 +65,7 @@ static int hevc_passthrough_filter(AVBSFContext *ctx, AVPacket *pkt)
     if (s->verbose) {
         av_log(ctx, AV_LOG_INFO, "HEVC packet with %d NAL units\n", s->fragment.nb_units);
     }
-    
+
     // 处理每个 NAL 单元
     for (int i = 0; i < s->fragment.nb_units; i++) {
         CodedBitstreamUnit *unit = &s->fragment.units[i];
@@ -124,7 +133,12 @@ static int hevc_passthrough_filter(AVBSFContext *ctx, AVPacket *pkt)
             case HEVC_NAL_TRAIL_R:
             case HEVC_NAL_TRAIL_N:
                 // 假设修改片头或片数据
-                // H265RawSlice *slice = (H265RawSlice *)unit->unit_data;
+                H265RawSlice *slice = (H265RawSlice *)unit->content;
+                if (slice->header.slice_type == HEVC_SLICE_B) {
+                    // 如果发现B帧，设置标记但继续处理当前包
+                    s->have_B_frame = true;
+                    av_log(ctx, AV_LOG_DEBUG, "B frame detected at NAL %d\n", i);
+                }
                 // 在这里修改片参数
                 break;
                 
@@ -132,6 +146,13 @@ static int hevc_passthrough_filter(AVBSFContext *ctx, AVPacket *pkt)
                 // 其他类型的 NAL 单元保持不变
                 break;
         }
+    }
+    
+    // 如果发现了B帧，可以选择使用原始包或跳过处理
+    if (s->have_B_frame) {
+        av_log(ctx, AV_LOG_DEBUG, "B frame detected, skipping processing but consuming input\n");
+        ff_cbs_fragment_reset(&s->fragment);
+        return 0;
     }
     
     // 创建一个新的数据包来存储修改后的数据
