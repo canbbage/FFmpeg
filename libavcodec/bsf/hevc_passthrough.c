@@ -37,12 +37,42 @@ typedef struct HEVCPassthroughContext {
     CodedBitstreamFragment fragment;
 
     bool have_B_frame;
+    
+    // POC跟踪
+    int real_poc;         // 当前真实POC值（始终递增）
+    int last_poc_lsb;     // 上一帧的POC LSB
+    int max_poc_lsb;      // MaxPicOrderCntLsb
+    
+    // 上一个slice的关键信息用于检测重复帧
+    int last_slice_type;
+    int last_slice_pic_order_cnt_lsb;
+    int last_slice_pic_parameter_set_id;
+    
 } HEVCPassthroughContext;
+
+// 检查是否是重复帧（根据slice header的关键字段）
+static int is_duplicate_slice(HEVCPassthroughContext *s, const H265RawSliceHeader *slice) {
+    // 如果尚未处理任何帧，则这不可能是重复帧
+    if (s->last_slice_pic_order_cnt_lsb < 0)
+        return 0;
+    
+    // 检查关键字段是否匹配
+    if (slice->slice_pic_order_cnt_lsb == s->last_slice_pic_order_cnt_lsb &&
+        slice->slice_type == s->last_slice_type &&
+        slice->slice_pic_parameter_set_id == s->last_slice_pic_parameter_set_id) {
+        return 1;
+    }
+    
+    return 0;
+}
 
 static int hevc_passthrough_filter(AVBSFContext *ctx, AVPacket *pkt)
 {
     HEVCPassthroughContext *s = ctx->priv_data;
     int ret;
+    int current_poc_lsb = -1;
+    int new_poc_lsb;
+    AVPacket *new_pkt = NULL;
     
     ret = ff_bsf_get_packet_ref(ctx, pkt);
     if (ret < 0)
@@ -100,50 +130,136 @@ static int hevc_passthrough_filter(AVBSFContext *ctx, AVPacket *pkt)
             }
         }
         
-        // 这里可以根据 NAL 类型添加不同的处理逻辑
-        // 以下是一些示例处理方式
+        // 处理NAL单元，检测和修改重复POC
         switch (unit->type) {
             case HEVC_NAL_VPS:
-                // 假设修改 VPS
-                // H265RawVPS *vps = (H265RawVPS *)unit->unit_data;
-                // 在这里修改 VPS 参数
+                // VPS处理，一般不需要修改
                 break;
                 
             case HEVC_NAL_SPS:
-                // 假设修改 SPS
-                // H265RawSPS *sps = (H265RawSPS *)unit->unit_data;
-                // 在这里修改 SPS 参数，例如修改分辨率、编码参数等
+                {
+                    // 从SPS获取MaxPicOrderCntLsb
+                    H265RawSPS *sps = (H265RawSPS *)unit->content;
+                    if (sps) {
+                        // log2_max_pic_order_cnt_lsb_minus4 + 4 计算 log2_max_pic_order_cnt_lsb
+                        int log2_max_poc_lsb = sps->log2_max_pic_order_cnt_lsb_minus4 + 4;
+                        s->max_poc_lsb = 1 << log2_max_poc_lsb;
+                        
+                        if (s->verbose) {
+                            av_log(ctx, AV_LOG_DEBUG, "SPS: MaxPicOrderCntLsb = %d\n", s->max_poc_lsb);
+                        }
+                    }
+                }
                 break;
                 
             case HEVC_NAL_PPS:
-                // 假设修改 PPS
-                // H265RawPPS *pps = (H265RawPPS *)unit->unit_data;
-                // 在这里修改 PPS 参数
+                // PPS处理，一般不需要修改
                 break;
                 
             case HEVC_NAL_SEI_PREFIX:
             case HEVC_NAL_SEI_SUFFIX:
-                // 假设修改或添加 SEI 消息
-                // H265RawSEI *sei = (H265RawSEI *)unit->unit_data;
-                // 在这里修改 SEI 消息
+                // SEI处理，一般不需要修改
                 break;
                 
             case HEVC_NAL_IDR_W_RADL:
             case HEVC_NAL_IDR_N_LP:
+                {
+                    H265RawSlice *slice = (H265RawSlice *)unit->content;
+                    if (!slice) {
+                        break;
+                    }
+                
+                    // IDR帧会重置POC计数
+                    s->real_poc = 0;
+                    
+                    if (s->verbose) {
+                        av_log(ctx, AV_LOG_DEBUG, "IDR frame: Resetting POC tracking\n");
+                    }
+                    
+                    // IDR帧POC应该为0
+                    if (slice->header.slice_pic_order_cnt_lsb != 0) {
+                        av_log(ctx, AV_LOG_DEBUG, "IDR frame: Correcting POC LSB from %d to 0\n", 
+                              slice->header.slice_pic_order_cnt_lsb);
+                        slice->header.slice_pic_order_cnt_lsb = 0;
+                    }
+                    
+                    // 重置跟踪信息
+                    s->last_poc_lsb = 0;
+                    s->last_slice_type = slice->header.slice_type;
+                    s->last_slice_pic_order_cnt_lsb = 0;
+                    s->last_slice_pic_parameter_set_id = slice->header.slice_pic_parameter_set_id;
+                    
+                    break; // IDR帧处理完直接break
+                }
+                
             case HEVC_NAL_TRAIL_R:
             case HEVC_NAL_TRAIL_N:
-                // 假设修改片头或片数据
-                H265RawSlice *slice = (H265RawSlice *)unit->content;
-                if (slice->header.slice_type == HEVC_SLICE_B) {
-                    // 如果发现B帧，设置标记但继续处理当前包
-                    s->have_B_frame = true;
-                    av_log(ctx, AV_LOG_DEBUG, "B frame detected at NAL %d\n", i);
+                {
+                    H265RawSlice *slice = (H265RawSlice *)unit->content;
+                    if (!slice) {
+                        break;
+                    }
+                    
+                    // 检测B帧
+                    if (slice->header.slice_type == HEVC_SLICE_B) {
+                        s->have_B_frame = true;
+                        av_log(ctx, AV_LOG_DEBUG, "B frame detected at NAL %d\n", i);
+                        continue;
+                    }
+                    
+                    // 获取当前帧的POC LSB值
+                    current_poc_lsb = slice->header.slice_pic_order_cnt_lsb;
+                    
+                    // 无论是否重复帧，都基于real_poc计算新的POC LSB值，确保POC连续
+                    new_poc_lsb = (s->real_poc + 1) % s->max_poc_lsb;
+                    
+                    // 检查是否是重复帧
+                    if (is_duplicate_slice(s, &slice->header)) {
+                        av_log(ctx, AV_LOG_DEBUG, "Duplicate slice detected. Changing POC LSB from %d to %d\n", 
+                              current_poc_lsb, new_poc_lsb);
+                        
+                        // 重复帧特殊处理 - 设置不显示标志
+                        slice->header.pic_output_flag = 0;
+                        
+                        // 对于IPPPP序列中的P帧，修改参考关系
+                        if (slice->header.slice_type == HEVC_SLICE_P) {
+                            // 修改参考列表标志
+                            slice->header.ref_pic_list_modification_flag_l0 = 1;
+                            
+                            // 具体如何修改参考关系需要根据实际情况调整
+                            // 在IPPPP序列中，通常我们希望重复的P帧引用"前前帧"而不是"前一帧"
+                            if (s->verbose) {
+                                av_log(ctx, AV_LOG_DEBUG, "Modifying reference for duplicate P frame\n");
+                            }
+                        }
+                    } else {
+                        // 非重复帧处理
+                        if (current_poc_lsb != new_poc_lsb && s->verbose) {
+                            av_log(ctx, AV_LOG_DEBUG, "Normal frame: Changing POC LSB from %d to %d\n", 
+                                  current_poc_lsb, new_poc_lsb);
+                        }
+                        
+                        if (s->verbose) {
+                            av_log(ctx, AV_LOG_DEBUG, "Processing new frame, POC LSB: %d, real POC: %d\n", 
+                                  new_poc_lsb, s->real_poc);
+                        }
+                    }
+                    
+                    // 共用部分：修改POC值、递增real_poc并更新状态跟踪信息
+                    slice->header.slice_pic_order_cnt_lsb = new_poc_lsb;
+                    s->real_poc++;
+                    
+                    // 更新跟踪信息 - 无论是否为重复帧都需要更新
+                    s->last_poc_lsb = new_poc_lsb;
+                    s->last_slice_type = slice->header.slice_type;
+                    s->last_slice_pic_order_cnt_lsb = new_poc_lsb;  // 使用新的POC值更新
+                    s->last_slice_pic_parameter_set_id = slice->header.slice_pic_parameter_set_id;
+                    
+                    break;
                 }
-                // 在这里修改片参数
-                break;
                 
             default:
-                // 其他类型的 NAL 单元保持不变
+                // 其他类型的NAL单元不需要处理
                 break;
         }
     }
@@ -156,7 +272,6 @@ static int hevc_passthrough_filter(AVBSFContext *ctx, AVPacket *pkt)
     }
     
     // 创建一个新的数据包来存储修改后的数据
-    AVPacket *new_pkt = NULL;
     new_pkt = av_packet_alloc();
     if (!new_pkt) {
         ret = AVERROR(ENOMEM);
@@ -201,12 +316,20 @@ static int hevc_passthrough_init(AVBSFContext *ctx)
         return AVERROR(EINVAL);
     }
     
-    if (s->verbose) {
-        // 如果启用了详细日志，初始化CBS上下文用于解析HEVC
-        ret = ff_cbs_init(&s->cbc, AV_CODEC_ID_HEVC, ctx);
-        if (ret < 0)
-            return ret;
-    }
+    // 初始化POC跟踪
+    s->last_poc_lsb = 0;
+    s->max_poc_lsb = 0; // 将在解析SPS时更新
+    s->real_poc = 0;
+    
+    // 初始化slice信息
+    s->last_slice_type = -1;
+    s->last_slice_pic_order_cnt_lsb = -1;
+    s->last_slice_pic_parameter_set_id = -1;
+    
+    // 始终初始化CBS上下文用于解析HEVC
+    ret = ff_cbs_init(&s->cbc, AV_CODEC_ID_HEVC, ctx);
+    if (ret < 0)
+        return ret;
     
     // 输出参数与输入相同
     ret = avcodec_parameters_copy(ctx->par_out, ctx->par_in);
@@ -220,10 +343,9 @@ static void hevc_passthrough_close(AVBSFContext *ctx)
 {
     HEVCPassthroughContext *s = ctx->priv_data;
     
-    if (s->verbose) {
-        ff_cbs_fragment_free(&s->fragment);
-        ff_cbs_close(&s->cbc);
-    }
+    // 始终释放CBS资源
+    ff_cbs_fragment_free(&s->fragment);
+    ff_cbs_close(&s->cbc);
 }
 
 static const AVOption hevc_passthrough_options[] = {
