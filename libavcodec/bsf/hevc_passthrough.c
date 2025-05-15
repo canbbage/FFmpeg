@@ -102,13 +102,42 @@ static void update_ref_list(HEVCPassthroughContext *s, AVBSFContext *ctx, int is
 static void modify_strps_for_duplicate(HEVCPassthroughContext *s, AVBSFContext *ctx, H265RawSlice *slice) {
     H265RawSliceHeader *header = &slice->header;
     H265RawSTRefPicSet *st_ref_pic_set = NULL;
+    CodedBitstreamH265Context *h265 = s->cbc->priv_data;
     
     /* I帧没有参考帧，直接返回 */
     if (header->slice_type == HEVC_SLICE_I)
         return;
     
-    /* 确保使用slice自定义的STRPS */
-    header->short_term_ref_pic_set_sps_flag = 0;
+    /* 检查STRPS是在SPS中还是在slice中 */
+    if (header->short_term_ref_pic_set_sps_flag) {
+        /* 从SPS中获取STRPS */
+        if (!h265 || !h265->active_sps) {
+            av_log(ctx, AV_LOG_ERROR, "Active SPS not found, cannot modify STRPS\n");
+            return;
+        }
+        
+        /* 复制SPS中的STRPS到slice header */
+        int idx = header->short_term_ref_pic_set_idx;
+        if (idx >= h265->active_sps->num_short_term_ref_pic_sets) {
+            av_log(ctx, AV_LOG_ERROR, "Invalid STRPS index %d (max %d)\n", 
+                   idx, h265->active_sps->num_short_term_ref_pic_sets);
+            return;
+        }
+        
+        /* 复制SPS中对应的STRPS */
+        memcpy(&header->short_term_ref_pic_set, 
+               &h265->active_sps->st_ref_pic_set[idx], 
+               sizeof(H265RawSTRefPicSet));
+        
+        /* 将标志设为0，表示我们现在使用slice中的STRPS */
+        header->short_term_ref_pic_set_sps_flag = 0;
+        
+        if (s->verbose) {
+            av_log(ctx, AV_LOG_DEBUG, "Copied STRPS from SPS[%d] to slice header\n", idx);
+        }
+    }
+    
+    /* 现在可以安全地修改slice中的STRPS */
     st_ref_pic_set = &header->short_term_ref_pic_set;
     
     /* 分析当前STRPS，看看它参考哪些帧，然后在第一位添加对原始帧的引用(但不使用) */
@@ -154,13 +183,43 @@ static void modify_strps_for_duplicate(HEVCPassthroughContext *s, AVBSFContext *
 /* 修复普通帧的STRPS，确保正确的参考关系 */
 static void fix_normal_frame_strps(HEVCPassthroughContext *s, AVBSFContext *ctx, H265RawSlice *slice) {
     H265RawSliceHeader *header = &slice->header;
+    H265RawSTRefPicSet *st_ref_pic_set = NULL;
+    CodedBitstreamH265Context *h265 = s->cbc->priv_data;
     
     /* I帧没有参考帧，直接返回 */
     if (header->slice_type == HEVC_SLICE_I)
         return;
     
+    /* 检查STRPS是在SPS中还是在slice中 */
+    if (header->short_term_ref_pic_set_sps_flag) {
+        /* 从SPS中获取STRPS */
+        if (!h265 || !h265->active_sps) {
+            av_log(ctx, AV_LOG_ERROR, "Active SPS not found, cannot modify STRPS\n");
+            return;
+        }
+        
+        /* 复制SPS中的STRPS到slice header */
+        int idx = header->short_term_ref_pic_set_idx;
+        if (idx >= h265->active_sps->num_short_term_ref_pic_sets) {
+            av_log(ctx, AV_LOG_ERROR, "Invalid STRPS index %d (max %d)\n", 
+                   idx, h265->active_sps->num_short_term_ref_pic_sets);
+            return;
+        }
+        
+        /* 复制SPS中对应的STRPS */
+        memcpy(&header->short_term_ref_pic_set, 
+               &h265->active_sps->st_ref_pic_set[idx], 
+               sizeof(H265RawSTRefPicSet));
+        
+        /* 将标志设为0，表示我们现在使用slice中的STRPS */
+        header->short_term_ref_pic_set_sps_flag = 0;
+        
+        if (s->verbose) {
+            av_log(ctx, AV_LOG_DEBUG, "Copied STRPS from SPS[%d] to slice header\n", idx);
+        }
+    }
+    
     /* 获取STRPS */
-    H265RawSTRefPicSet *st_ref_pic_set = NULL;
     st_ref_pic_set = &header->short_term_ref_pic_set;
     /* 统计原始参考数 */
     int orig_neg_count = st_ref_pic_set->num_negative_pics;
@@ -181,15 +240,9 @@ static void fix_normal_frame_strps(HEVCPassthroughContext *s, AVBSFContext *ctx,
         return;
     
     /* 前面有复制帧，需要修改当前帧的STRPS */
-
-    
-    /* 确保使用slice自定义的STRPS */
-    header->short_term_ref_pic_set_sps_flag = 0;
     
     /* 禁用STRPS预测 */
     st_ref_pic_set->inter_ref_pic_set_prediction_flag = 0;
-    
-
     
     /* 保存原始的deltaPOC值和used标志 */
     uint16_t orig_delta_poc[HEVC_MAX_REFS];
@@ -213,8 +266,12 @@ static void fix_normal_frame_strps(HEVCPassthroughContext *s, AVBSFContext *ctx,
         }
         st_ref_pic_set->used_by_curr_pic_s0_flag[i] = orig_used[i];
     }
-    st_ref_pic_set->num_negative_pics = 4;
     
+    /* 不需要特别处理temporal MV - 普通帧应该正常参考其前一帧 */
+    /* 即使前一帧是复制帧，也应该保持正常的参考关系 */
+    /* 原始编码器设置的temporal MV参考应该已经是正确的 */
+    
+    st_ref_pic_set->num_negative_pics = 4;
 }
 
 static int hevc_passthrough_filter(AVBSFContext *ctx, AVPacket *pkt)
